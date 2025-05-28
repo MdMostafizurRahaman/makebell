@@ -15,15 +15,23 @@ def extract_changes_from_word(path):
 
     for rev in doc.Revisions:
         try:
-            if rev.Type in [1, 2]:  # 1 = insert, 2 = delete
-                changes.append({
-                    'type': 'insert' if rev.Type == 1 else 'delete',
-                    'text': rev.Range.Text.strip(),
-                    'context': rev.Range.Paragraphs(1).Range.Text.strip()
-                })
+            rev_type = rev.Type
+            rev_text = rev.Range.Text.strip()
+            context = rev.Range.Paragraphs(1).Range.Text.strip()
+
+            if rev_type == 1:  # insert
+                changes.append({'type': 'insert', 'text': rev_text, 'context': context})
+            elif rev_type == 2:  # delete
+                changes.append({'type': 'delete', 'text': rev_text, 'context': context})
+            elif rev_type == 3:  # format change
+                changes.append({'type': 'format', 'text': rev_text, 'context': context})
+            elif rev_type == 4:  # property change, like list to plain
+                changes.append({'type': 'format-list', 'text': rev_text, 'context': context})
+            elif rev_type == 5:  # style definition change
+                changes.append({'type': 'format-style', 'text': rev_text, 'context': context})
         except Exception as e:
             print(f"Error reading revision: {e}")
-    
+
     doc.Close(False)
     word.Quit()
     return changes
@@ -46,6 +54,16 @@ def find_best_match(target, paragraph_list):
             max_score = score
             best = p
     return best
+
+change_count = {
+    'insert': 0,
+    'delete': 0,
+    'format': 0,
+    'format-style': 0,
+    'format-list': 0,
+    'skipped': 0
+}
+
 
 def apply_changes_to_chinese(chinese_doc_path, changes):
     word = win32.gencache.EnsureDispatch('Word.Application')
@@ -75,9 +93,25 @@ def apply_changes_to_chinese(chinese_doc_path, changes):
                         delete_range = rng.Duplicate
                         delete_range.SetRange(rng.Start + start, rng.Start + start + len(zh_text))
                         delete_range.Delete()
+                    change_count['delete'] += 1
+
                 elif change['type'] == 'insert':
                     rng.InsertAfter(f"{zh_text}")
-                break
+                    change_count['insert'] += 1
+
+                elif change['type'] in ['format', 'format-style']:
+                    rng.InsertAfter(f"[FORMATTED:{zh_text}]")
+                    change_count['format'] += 1
+
+                elif change['type'] == 'format-list':
+                    rng.InsertAfter(f"[LIST-CHANGED:{zh_text}]")
+                    change_count['format-list'] += 1
+
+                break  # 🔁 This break should be inside the IF block (after change applied)
+
+    print("\n📊 Change Summary:")
+    for k, v in change_count.items():
+        print(f"  - {k}: {v}")
 
     output_path = chinese_doc_path.replace('.docx', '_with_tracked_changes.docx')
     doc.SaveAs(output_path)

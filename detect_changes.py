@@ -1,131 +1,217 @@
 import zipfile
-import xml.etree.ElementTree as ET
-from docx import Document
-from googletrans import Translator
-import difflib
+import shutil
+import os
+from lxml import etree as ET
+import tempfile
 
-# ========== Step 1: Extract tracked changes from English docx ==========
-def extract_tracked_changes(docx_path):
+# Namespaces for WordprocessingML
+NS = {
+    'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+}
+
+def extract_document_xml(docx_path):
+    with zipfile.ZipFile(docx_path) as z:
+        with z.open('word/document.xml') as f:
+            xml = f.read()
+    return xml
+
+def write_document_xml(docx_path, new_xml_bytes, output_path):
+    # Copy original docx to output
+    shutil.copy(docx_path, output_path)
+    with zipfile.ZipFile(output_path, 'a') as z:
+        # Overwrite document.xml with new content
+        z.writestr('word/document.xml', new_xml_bytes)
+
+def parse_changes_from_en_docx(docx_path):
+    """
+    Parse English DOCX with tracked changes.
+    Return list of changes as dicts:
+    {'paragraph': int, 'run': int, 'type': str, 'text': str}
+    Types: add, delete, replace, format, format_bold, format_list
+    """
     changes = []
     with zipfile.ZipFile(docx_path) as docx_zip:
         with docx_zip.open("word/document.xml") as document_xml:
             tree = ET.parse(document_xml)
             root = tree.getroot()
-            namespaces = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+            paragraphs = root.findall('.//w:body/w:p', NS)
 
-            for para_index, para in enumerate(root.findall('.//w:p', namespaces)):
-                inserted = para.findall('.//w:ins//w:t', namespaces)
-                deleted = para.findall('.//w:del//w:t', namespaces)
-                if inserted:
-                    text = ''.join([t.text for t in inserted if t.text])
-                    if text.strip():
-                        changes.append({
-                            'paragraph': para_index,
-                            'type': 'insert',
-                            'text': text.strip()
-                        })
-                if deleted:
-                    text = ''.join([t.text for t in deleted if t.text])
-                    if text.strip():
-                        changes.append({
-                            'paragraph': para_index,
-                            'type': 'delete',
-                            'text': text.strip()
-                        })
+            for p_idx, para in enumerate(paragraphs):
+                is_list = para.find('.//w:numPr', NS) is not None
+                runs = para.findall('.//w:r', NS)
+                prev_del_text = None
+                for r_idx, run in enumerate(runs):
+                    text_el = run.find('.//w:t', NS)
+                    if text_el is None or not text_el.text:
+                        continue
+                    text = text_el.text.strip()
+
+                    rpr = run.find('.//w:rPr', NS)
+                    is_bold = rpr is not None and rpr.find('.//w:b', NS) is not None
+                    is_formatted = rpr is not None
+
+                    # Check if run or parent has <w:ins> or <w:del>
+                    # We check ancestors by climbing up parents
+                    parent = run.getparent()
+                    change_type = None
+                    while parent is not None and parent.tag != '{%s}p' % NS['w']:
+                        tag_local = ET.QName(parent).localname
+                        if tag_local == 'ins':
+                            if prev_del_text:
+                                change_type = 'replace'
+                            else:
+                                change_type = 'add'
+                            break
+                        elif tag_local == 'del':
+                            prev_del_text = text
+                            change_type = 'delete'
+                            break
+                        parent = parent.getparent()
+
+                    if change_type == 'replace':
+                        changes.append({'paragraph': p_idx, 'run': r_idx, 'type': 'replace', 'text': prev_del_text + " -> " + text})
+                        prev_del_text = None
+                    elif change_type in ('add', 'delete'):
+                        changes.append({'paragraph': p_idx, 'run': r_idx, 'type': change_type, 'text': text})
+                    else:
+                        # No add/del parent, but maybe formatting
+                        if is_bold:
+                            changes.append({'paragraph': p_idx, 'run': r_idx, 'type': 'format_bold', 'text': text})
+                        elif is_formatted:
+                            changes.append({'paragraph': p_idx, 'run': r_idx, 'type': 'format', 'text': text})
+
+                if is_list:
+                    # For lists mark format_list
+                    para_text = ''.join(t.text for t in para.findall('.//w:t', NS) if t.text)
+                    if para_text:
+                        changes.append({'paragraph': p_idx, 'run': None, 'type': 'format_list', 'text': para_text})
     return changes
 
-# ========== Step 2: Translate English to Chinese ==========
-def translate_to_chinese(texts):
-    translator = Translator()
-    translations = []
-    for text in texts:
-        try:
-            translated = translator.translate(text, src='en', dest='zh-cn').text
-            translations.append(translated)
-        except Exception as e:
-            translations.append(f"Error translating: {text}")
-    return translations
+def insert_track_changes_to_cn_docx(en_changes, cn_docx_path, output_path):
+    with zipfile.ZipFile(cn_docx_path) as docx_zip:
+        with docx_zip.open("word/document.xml") as document_xml:
+            tree = ET.parse(document_xml)
+            root = tree.getroot()
+            paragraphs = root.findall('.//w:body/w:p', NS)
 
-# ========== Step 3: Load Chinese paragraphs ==========
-def load_chinese_paragraphs(docx_path):
-    doc = Document(docx_path)
-    return [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            for change in en_changes:
+                p_idx = change['paragraph']
+                r_idx = change['run']
+                ctype = change['type']
+                if p_idx >= len(paragraphs):
+                    continue
+                para = paragraphs[p_idx]
+                runs = para.findall('.//w:r', NS)
 
-# ========== Step 4: Match translated Chinese to Chinese doc ==========
-def match_translations_to_chinese(translations, chinese_paragraphs):
-    matches = []
-    for translation in translations:
-        best_match = None
-        best_ratio = 0
-        best_index = -1
-        for i, para in enumerate(chinese_paragraphs):
-            ratio = difflib.SequenceMatcher(None, translation, para).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match = para
-                best_index = i
-        matches.append({
-            'translated_text': translation,
-            'matched_paragraph': best_match,
-            'paragraph_index': best_index,
-            'similarity': round(best_ratio, 2)
-        })
-    return matches
+                if ctype == 'add':
+                    if r_idx is not None and r_idx < len(runs):
+                        run = runs[r_idx]
+                        # Wrap run inside <w:ins>
+                        ins = ET.Element('{%s}ins' % NS['w'])
+                        run_copy = ET.fromstring(ET.tostring(run))
+                        ins.append(run_copy)
+                        para.replace(run, ins)
+                    else:
+                        ins = ET.Element('{%s}ins' % NS['w'])
+                        r = ET.Element('{%s}r' % NS['w'])
+                        t = ET.Element('{%s}t' % NS['w'])
+                        t.text = change['text']
+                        r.append(t)
+                        ins.append(r)
+                        para.append(ins)
 
-# ========== Step 5: Insert tracker text into Chinese document ==========
-def insert_tracker_text(doc, report):
-    for item in report:
-        para_index = item['paragraph_index']
-        if para_index < 0 or para_index >= len(doc.paragraphs):
-            continue
-        para = doc.paragraphs[para_index]
-        # Append tracking note as italic text
-        note = f"\n[TRACK-{item['change_type'].upper()}: {item['translated_chinese_text']}]"
-        para.add_run(note).italic = True
+                elif ctype == 'delete':
+                    if r_idx is not None and r_idx < len(runs):
+                        run = runs[r_idx]
+                        dele = ET.Element('{%s}del' % NS['w'])
+                        run_copy = ET.fromstring(ET.tostring(run))
+                        dele.append(run_copy)
+                        para.replace(run, dele)
 
-# ========== Main Pipeline ==========
-def main():
-    # Input paths
-    english_docx = "edited_en.docx"
-    chinese_docx = "original_cn.docx"
-    output_docx = "Chinese_with_Tracked_Changes.docx"
+                elif ctype == 'replace':
+                    if r_idx is not None and r_idx < len(runs):
+                        run = runs[r_idx]
+                        # Wrap original run as deleted
+                        dele = ET.Element('{%s}del' % NS['w'])
+                        run_copy = ET.fromstring(ET.tostring(run))
+                        dele.append(run_copy)
+                        para.replace(run, dele)
+                        # Insert new run with inserted text after dele element
+                        ins = ET.Element('{%s}ins' % NS['w'])
+                        r = ET.Element('{%s}r' % NS['w'])
+                        t = ET.Element('{%s}t' % NS['w'])
+                        # New text is after '->' in change text
+                        new_text = change['text'].split('->')[-1].strip()
+                        t.text = new_text
+                        r.append(t)
+                        ins.append(r)
+                        # Find dele index
+                        dele_idx = para.index(dele)
+                        para.insert(dele_idx + 1, ins)
+                    else:
+                        # If no run found, just add inserted text
+                        ins = ET.Element('{%s}ins' % NS['w'])
+                        r = ET.Element('{%s}r' % NS['w'])
+                        t = ET.Element('{%s}t' % NS['w'])
+                        new_text = change['text'].split('->')[-1].strip()
+                        t.text = new_text
+                        r.append(t)
+                        ins.append(r)
+                        para.append(ins)
 
-    # Step 1: Extract changes
-    print("🔍 Extracting tracked changes from English document...")
-    changes = extract_tracked_changes(english_docx)
-    english_changes = [c['text'] for c in changes]
+                elif ctype == 'format_bold':
+                    if r_idx is not None and r_idx < len(runs):
+                        run = runs[r_idx]
+                        rPr = run.find('{%s}rPr' % NS['w'])
+                        if rPr is None:
+                            rPr = ET.SubElement(run, '{%s}rPr' % NS['w'])
+                        b = rPr.find('{%s}b' % NS['w'])
+                        if b is None:
+                            ET.SubElement(rPr, '{%s}b' % NS['w'])
 
-    # Step 2: Translate changes
-    print("🌐 Translating changes to Chinese...")
-    translations = translate_to_chinese(english_changes)
+                elif ctype == 'format':
+                    if r_idx is not None and r_idx < len(runs):
+                        run = runs[r_idx]
+                        rPr = run.find('{%s}rPr' % NS['w'])
+                        if rPr is None:
+                            rPr = ET.SubElement(run, '{%s}rPr' % NS['w'])
+                        highlight = rPr.find('{%s}highlight' % NS['w'])
+                        if highlight is None:
+                            highlight = ET.SubElement(rPr, '{%s}highlight' % NS['w'])
+                            highlight.set('{%s}val' % NS['w'], 'yellow')
 
-    # Step 3: Load Chinese doc paragraphs
-    print("📄 Loading Chinese document...")
-    chinese_paragraphs = load_chinese_paragraphs(chinese_docx)
+                elif ctype == 'format_list':
+                    numPr = para.find('{%s}numPr' % NS['w'])
+                    if numPr is None:
+                        numPr = ET.SubElement(para, '{%s}numPr' % NS['w'])
+                    ilvl = numPr.find('{%s}ilvl' % NS['w'])
+                    if ilvl is None:
+                        ilvl = ET.SubElement(numPr, '{%s}ilvl' % NS['w'])
+                    ilvl.set('{%s}val' % NS['w'], '0')
+                    numId = numPr.find('{%s}numId' % NS['w'])
+                    if numId is None:
+                        numId = ET.SubElement(numPr, '{%s}numId' % NS['w'])
+                    numId.set('{%s}val' % NS['w'], '1')
 
-    # Step 4: Match translated changes to Chinese
-    print("🧠 Matching translations to Chinese paragraphs...")
-    matches = match_translations_to_chinese(translations, chinese_paragraphs)
+    new_xml = ET.tostring(root, encoding='UTF-8', xml_declaration=True, pretty_print=True)
+    write_document_xml(cn_docx_path, new_xml, output_path)
 
-    # Step 5: Combine into report
-    final_report = []
-    for change, match in zip(changes, matches):
-        final_report.append({
-            'change_type': change['type'],
-            'original_english_text': change['text'],
-            'translated_chinese_text': match['translated_text'],
-            'matched_chinese_paragraph': match['matched_paragraph'],
-            'paragraph_index': match['paragraph_index'],
-            'similarity': match['similarity']
-        })
 
-    # Step 6: Inject tracker into Chinese doc
-    print("✏️ Writing changes into Chinese document...")
-    doc = Document(chinese_docx)
-    insert_tracker_text(doc, final_report)
-    doc.save(output_docx)
+def main(en_docx_path, cn_docx_path, output_path):
+    print(f"Parsing English DOCX for changes...")
+    en_changes = parse_changes_from_en_docx(en_docx_path)
+    print(f"Detected {len(en_changes)} changes in English DOCX")
 
-    print(f"✅ Done! Output saved as: {output_docx}")
+    print(f"Inserting changes into Chinese DOCX...")
+    insert_track_changes_to_cn_docx(en_changes, cn_docx_path, output_path)
+    print(f"Output saved to {output_path}")
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) != 4:
+        print("Usage: python script.py english_with_track_changes.docx chinese_without_changes.docx output_chinese_with_track_changes.docx")
+    else:
+        en_docx_path = sys.argv[1]
+        cn_docx_path = sys.argv[2]
+        output_path = sys.argv[3]
+        main(en_docx_path, cn_docx_path, output_path)

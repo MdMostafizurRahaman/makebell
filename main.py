@@ -158,6 +158,7 @@ def apply_changes_to_chinese(chinese_doc_path, changes):
     word.Quit()
     return output_path
 
+
 def main():
     import os
     base_dir = os.path.dirname(os.path.abspath(__file__))

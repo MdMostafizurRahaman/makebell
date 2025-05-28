@@ -8,35 +8,48 @@ def extract_changes_from_word(path):
     word = win32.gencache.EnsureDispatch('Word.Application')
     word.Visible = False
     doc = word.Documents.Open(path)
-    # doc.TrackRevisions = True
-
     changes = []
 
-    for rev in doc.Revisions:
+    raw_revs = list(doc.Revisions)
+    skip_next = False
+
+    for i, rev in enumerate(raw_revs):
+        if skip_next:
+            skip_next = False
+            continue
+
         try:
             rev_type = rev.Type
             rev_text = rev.Range.Text.strip()
             context = rev.Range.Paragraphs(1).Range.Text.strip()
             formatted = rev.Range.Font.Bold
 
-            change = {
-                'text': rev_text,
-                'context': context,
-                'bold': bool(formatted)
-            }
+            # Check for a replace pattern (delete + insert)
+            if rev_type == 2 and i + 1 < len(raw_revs):
+                next_rev = raw_revs[i + 1]
+                if next_rev.Type == 1:
+                    next_text = next_rev.Range.Text.strip()
+                    next_context = next_rev.Range.Paragraphs(1).Range.Text.strip()
+                    if context == next_context:
+                        changes.append({
+                            'type': 'replace',
+                            'text_deleted': rev_text,
+                            'text_inserted': next_text,
+                            'context': context,
+                            'bold': bool(next_rev.Range.Font.Bold)
+                        })
+                        skip_next = True
+                        continue  # Skip normal handling
 
+            # Regular insert/delete/format/etc.
             if rev_type == 1:
-                change['type'] = 'insert'
+                changes.append({'type': 'insert', 'text': rev_text, 'context': context, 'bold': bool(formatted)})
             elif rev_type == 2:
-                change['type'] = 'delete'
-            elif rev_type in (3, 4, 5):
-                change['type'] = 'format'
-            else:
-                continue  # skip unknown types
-
-            changes.append(change)
+                changes.append({'type': 'delete', 'text': rev_text, 'context': context, 'bold': bool(formatted)})
+            elif rev_type in (3, 4, 5, 6):
+                changes.append({'type': 'format', 'text': rev_text, 'context': context, 'bold': bool(formatted)})
         except Exception as e:
-            print(f"⚠️ Error reading revision: {e}")
+            print(f"⚠️ Error on revision {i}: {e}")
 
     doc.Close(False)
     word.Quit()
@@ -80,8 +93,13 @@ def apply_changes_to_chinese(chinese_doc_path, changes):
         if 'type' not in change:
             change_count['skipped'] += 1
             continue
-        zh_text = translate_text(change['text'])
-        zh_context = translate_text(change['context'])
+        if change['type'] == 'replace':
+            zh_old = translate_text(change.get('text_deleted'))
+            zh_new = translate_text(change.get('text_inserted'))
+            zh_context = translate_text(change.get('context'))
+        else:
+            zh_text = translate_text(change.get('text'))
+            zh_context = translate_text(change.get('context'))
 
         if not zh_text or not zh_context:
             change_count['skipped'] += 1
@@ -95,6 +113,7 @@ def apply_changes_to_chinese(chinese_doc_path, changes):
         for p in doc.Paragraphs:
             if best_para.strip() == p.Range.Text.strip():
                 rng = p.Range
+
                 if change['type'] == 'delete':
                     start = rng.Text.find(zh_text)
                     if start >= 0:
@@ -107,6 +126,16 @@ def apply_changes_to_chinese(chinese_doc_path, changes):
                     rng.InsertAfter(f"{zh_text}")
                     change_count['insert'] += 1
 
+                elif change['type'] == 'replace':
+                    start = rng.Text.find(zh_old)
+                    if start >= 0:
+                        replace_range = rng.Duplicate
+                        replace_range.SetRange(rng.Start + start, rng.Start + start + len(zh_old))
+                        replace_range.Text = zh_new
+                        change_count['replace'] += 1
+                    else:
+                        change_count['skipped'] += 1
+
                 elif change['type'] == 'format':
                     formatted_text = f"[FORMATTED:{zh_text}]"
                     if change.get('bold'):
@@ -117,6 +146,7 @@ def apply_changes_to_chinese(chinese_doc_path, changes):
                     rng.InsertAfter(formatted_text)
 
                 break
+
 
     print("\n📊 Change Summary:")
     for k, v in change_count.items():
